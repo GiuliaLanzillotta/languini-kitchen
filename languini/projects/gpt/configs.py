@@ -51,11 +51,21 @@ def add_exp_name(config):
 
 
 ## Add experiment configs
-def load_config(name=None):
+
+def add_distil_configs(config):
+    """ Adding the config parameters used in a distillation experiment."""
+    config.alpha = 0
+    """ this is a GPT-medium size model trained for 96h RTX3090 hours which resulted in about 5.7B training tokens. 
+    The training data is about 24B tokens in total. Achieves 2.032 nppl. It has about 330M parameters"""
+    config.teacher_checkpoint_path = "/media/hofmann-scratch/glanzillo/languini-models/gpt-medium"
+    config.mse = False # flag: whether to use the mse loss or KL 
+    return config
+
+def load_config(name=None, distil_experiment=False):
 
     c = Munch(
         # data
-        data_root = "data/books",
+        data_root = "/local/home/stuff/languini_data/books",
         relative_log_path = "logs",         # Relative path to the log folder within the project folder languini-kitchen/projects/gpt/logs/
         dataset = "books_16384",
         vocab_size = 16384,
@@ -75,6 +85,7 @@ def load_config(name=None):
         min_lr = 0.000006,                  # final learning rate
         grad_clip_norm = 0.0,               # gradient norm clipping
         tokens_per_second = 0,              # tokens per second throughput of this config on the hardware run; used for logging over gpuhours
+        sgd=False,                          # whether to use SGD as optimizer
 
         # perform certain tasks every N steps
         eval_every = 1_000,                 # perform a fast evaluation
@@ -85,8 +96,9 @@ def load_config(name=None):
         log_ckpt_every = 5_000,             # save model checkpoint to disk
 
         # logging
-        logger_type = 'all',  # can be 'tb', 'wandb' or 'all'
-        wandb_project_name = 'gpt',
+        logger_type = 'wandb',  # can be 'tb', 'wandb' or 'all'
+        wandb_project_name = 'DataEfficientDistillation', 
+        wandb_entity_name = 'continually',
     )
     # default model
     if not name or name == 'default':
@@ -100,6 +112,12 @@ def load_config(name=None):
         c.mlp_dim = 2048
         c.head_dim = 32
         c.n_heads = 8
+    if name == 'mini2':
+        c.n_layers = 4
+        c.h_dim = 1024
+        c.mlp_dim = 2048
+        c.head_dim = 64
+        c.n_heads = 16
     elif name == 'tiny':
         c.n_layers = 4
         c.h_dim = 768
@@ -132,5 +150,7 @@ def load_config(name=None):
         c.n_heads = 24
     else:
         raise ValueError(f"Config name {name} is an invalid name. ")
+    
+    if distil_experiment: c = add_distil_configs(c)
 
     return c

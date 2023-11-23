@@ -71,7 +71,6 @@ class Model(torch.nn.Module):
        return None
     
     def forward(self, x, state, log=None):
-        # x: [batch_size, seq_length]
         bsz, seqlen = x.shape
         c = self.c
 

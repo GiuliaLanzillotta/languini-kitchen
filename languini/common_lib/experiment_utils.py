@@ -79,6 +79,7 @@ def save_source_code(project_path, logger):
                     zf.writestr(rel_path, f.read())
         print(f"Successfully created a source code backup for {len(python_files)} python files.")
 
+    mprint("We'll try to read the code files")
     if logger.use_tb:
         zip_file_path = os.path.join(logger.log_path, "source.zip")
         save_zipfile(zip_file_path)
@@ -94,7 +95,7 @@ def save_config(config):
 
 
 def setup_experiment(config):
-    config.log_path = os.path.join(config.project_path, config.relative_log_path, config.exp_name)
+    config.log_path = os.path.join(config.project_path, config.relative_log_path, 'results', config.exp_name, config.exp_id)
     
     if not is_main_process():
         return logger.Logger(config)
@@ -106,7 +107,7 @@ def setup_experiment(config):
     logger_obj = logger.Logger(config)
     
     # save the current python files as zip file in the log folder
-    save_source_code(config.project_path, logger_obj)
+    #save_source_code(config.project_path, logger_obj)
 
     # save the used config in the log folder
     save_config(config)

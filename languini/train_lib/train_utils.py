@@ -54,7 +54,6 @@ def load_tokeniser(config):
       raise Exception("Couldn't load tokeniser.")
   return sp
 
-
 def load_checkpoint(model, path):
     """Loads a model from a checkpoint on disk. """
     new_state_dict = {}
@@ -64,7 +63,6 @@ def load_checkpoint(model, path):
         for key, value in model_state_dict.items():
             new_state_dict[key] = value
         model.load_state_dict(new_state_dict)
-
         curr_state = checkpoint["curr_state"] if 'curr_state' in checkpoint else None
     return model, curr_state
 

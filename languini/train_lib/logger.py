@@ -160,10 +160,14 @@ class Logger:
             if self.use_wandb:
                 wandb_args = {
                     "project": c.wandb_project_name,
+                    "entity": c.wandb_entity_name,
+                    "notes": c.wandb_notes,
+                    "name": c.exp_name,
                     "config": Munch.toDict(c),
                 }
+                
                 wandb.init(**wandb_args)
-                self.wandb_run_dir = wandb.run.dir
+                self.wandb_run_dir = wandb.run.dir #TODO
 
             os.makedirs(self.log_path, exist_ok=True)
             if self.use_tb:
