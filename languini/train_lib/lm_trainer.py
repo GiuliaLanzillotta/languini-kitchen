@@ -16,9 +16,15 @@ import json
 import os
 import math
 import torch
+import sys
 import sentencepiece as spm
 import torch.nn.functional as F
 import torch.distributed as dist
+
+
+internal_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(internal_path)
+sys.path.append(internal_path+ '../../../utils')
 
 from tqdm import tqdm
 from languini.train_lib import train_utils
@@ -27,6 +33,8 @@ from languini.common_lib import common_utils
 from languini.common_lib import parallel_utils
 from languini.common_lib.debug_utils import check
 from languini.train_lib.logger import CustomXAxisScalar
+from utils.kernels import centered_kernal_alignment, features_alignment
+
 
 
 DEFAULT_CONFIG = {
@@ -48,6 +56,134 @@ DEFAULT_CONFIG = {
     "log_activations_every": 5_000, # log model activations to disk
 }
 
+
+def evaluate_alignments(config_s, config_t,  student, teacher,  data_source, max_steps, class_frequencies, last_n=-1, print_progress=False, within_batch=False, weigh_by_frequency=False):
+    """
+    Evaluates the student and teacher cka and fa. 
+    
+    Args:
+        config_s, config_t (Munch): an experiment config.
+        student, teacher: PyTorch models.
+        data_source: the source for the input and target batches.
+        max_step (int): number of batches do process for evaluation.
+        last_n (int): evaluate loss on the last_n targets. If last_n is -1 it will evaluate on all targets.
+        print_progress (bool): simple terminal log for eval.py to display progress.
+    """
+
+    c_s = config_s
+    c_t = config_t
+    local_bsz = c_s.eval_batch_size // c_s.n_workers
+
+    assert last_n <= c_s.seq_len and last_n != 0, "we cannot eval on the last_n=0 tokens or more tokens than there are in a sequence!"
+    assert max_steps == -1 or max_steps > 0, "Maximum number of steps has to be either -1 or a positive value."
+
+    student.eval()
+    teacher.eval()
+    data_source.reset()
+
+    batch_count = 0
+    total = 0
+    features_s = []
+    features_t = []
+    labels = []
+    
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(enabled=c_s.device.type == "cuda"):
+            
+            
+            # iterate over batches
+            if print_progress and max_steps > 0: 
+                progress_bar = tqdm(range(max_steps))
+            while total <= 5000: 
+                if print_progress and max_steps > 0:
+                    progress_bar.update(1)
+                    progress_bar.refresh()
+                elif print_progress and batch_count % 1_000 == 0 and batch_count > 0:
+                    parallel_utils.mprint(f"{batch_count:d}")
+
+                try:
+                    # take the next training batch
+                    batch_x, batch_y, is_padded = next(data_source)
+                    batch_x = batch_x[0]
+                    batch_y = batch_y[0]
+                    bsz, seqlen = batch_x.shape
+                except StopIteration:
+                    break
+                
+                # run the forward pass
+                if isinstance(student, torch.nn.parallel.DistributedDataParallel):
+                    phi_s = student.module.get_features(batch_x)
+                    phi_t = teacher.module.get_features(batch_x)
+
+                else:
+                    phi_s = student.get_features(batch_x)
+                    phi_t = teacher.get_features(batch_x)
+
+
+
+                # If last_n is positive we only care about the last_n losses and targets.
+                if last_n == -1:
+                    last_n = seqlen
+                batch_x = batch_x[:, -last_n:]
+                check(batch_x, (bsz, last_n))
+                phi_s = phi_s[:, -last_n:, :]
+                phi_t = phi_t[:, -last_n:, :]
+                batch_y = batch_y[:, -last_n:]
+                check(batch_y, (bsz, last_n))
+                
+                # compute loss
+                phi_s = phi_s.reshape(bsz * last_n, c_s.h_dim)
+                phi_t = phi_t.reshape(bsz * last_n, c_t.h_dim)
+                batch_y = batch_y.reshape(bsz * last_n, 1)
+                batch_y_one_hot = F.one_hot(batch_y, num_classes=c_s.vocab_size).to(torch.float).reshape(-1, c_s.vocab_size)
+                check(batch_y_one_hot, (bsz*last_n, c_s.vocab_size))
+
+                total+=bsz * last_n
+
+                features_s.append(phi_s)
+                features_t.append(phi_t)
+                labels.append(batch_y_one_hot)
+                
+                batch_count+=1
+
+
+            features_s = torch.vstack(features_s).view(-1, c_s.h_dim)
+            features_t = torch.vstack(features_t).view(-1, c_t.h_dim)
+            labels = torch.vstack(labels).view(-1, c_s.vocab_size)
+
+            class_frequencies1 = class_frequencies + 1
+            class_frequencies1_norm = class_frequencies1/class_frequencies1.sum() # frequencies sum to one
+            weight = (1/class_frequencies1_norm).view(1, c_s.vocab_size) # 1xC
+            weighted_classes = labels * weight # NxC
+            samples_weight = weighted_classes.sum(dim=1).view(-1, 1) #N --> we sum over C because there is only one active class per sample
+            samples_weight = samples_weight/samples_weight.max() # normalising
+
+            if c_s.h_dim==c_t.h_dim:
+                    FA = features_alignment(features_t, features_s)
+            else: FA=torch.Tensor([-1]).to(c_s.device)
+
+            if weigh_by_frequency:
+                features_s = features_s*samples_weight
+                features_t = features_t*samples_weight
+
+            KS = torch.matmul(features_s, features_s.T)
+            KT = torch.matmul(features_t, features_t.T)
+
+            KS = KS/torch.max(KS)
+            KT = KT/torch.max(KT)
+
+            CKA = centered_kernal_alignment(KS, KT)
+            print("CKA", CKA)
+        
+        parallel_utils.mprint(f'total number of batches processed: {batch_count}')
+        dist.all_reduce(CKA, dist.ReduceOp.SUM)
+        dist.all_reduce(FA, dist.ReduceOp.SUM)
+        total_machines = parallel_utils.WORLD_SIZE # average CKA and FA results
+
+
+
+    return CKA.cpu().item()/total_machines, FA.cpu().item()/total_machines
 
 def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_progress=False):
     """
@@ -149,7 +285,7 @@ def evaluation(config, model, state, data_source, max_steps, last_n=-1, print_pr
                 batch_count += 1
         
         parallel_utils.mprint(f'total number of batches processed: {batch_count}')
-        dist.all_reduce(total_loss, dist.ReduceOp.SUM)
+        dist.all_reduce(total_loss, dist.ReduceOp.SUM) 
         dist.all_reduce(total_token_count, dist.ReduceOp.SUM)
 
     return total_loss.item(), total_top_k_counts, total_token_count.item(), state
@@ -527,9 +663,10 @@ class LMTrainer:
 class LMDistilTrainer:
     """A language modelling trainer. """
     
-    def __init__(self, config, logger, model, teacher, opt, train_batches, eval_batches, scheduler=None):
+    def __init__(self, config, config_t, logger, model, teacher, opt, train_batches, eval_batches, scheduler=None, class_frequencies=None):
         train_utils.check_config(config, DEFAULT_CONFIG)
         self.c = c = config
+        self.c_t =  config_t
         self.logger = logger
         self.model = model.to(config.device)
         self.teacher = teacher.to(config.device)
@@ -538,6 +675,7 @@ class LMDistilTrainer:
         self.train_batches = train_batches
         self.eval_batches = eval_batches
         self.scaler = torch.cuda.amp.GradScaler(enabled=c.device.type == "cuda")
+        self.class_frequencies = torch.Tensor(class_frequencies).to(self.c.device)
 
         # log hyperparameters
         train_utils.log_hyperparams(config, self.logger)
@@ -583,22 +721,26 @@ class LMDistilTrainer:
         eval_watch = train_utils.StopWatch()       # evaluation
         total_watch = train_utils.StopWatch()       # total step
         tokens_seen = 0                             # total number of tokens seen
-        
+
         curr_state = None
         teacher_curr_state = None
         total_watch.start()
         average_logits_magnitude = 0 # running estimate
         total = 0
+        T = c.temperature
+        print(f"Training with temperature {T}")
 
         if c.mse: print("Using MSE loss to train.")
 
         for step in range(c.max_train_steps):
             self.model.train()
             self.teacher.eval()
+            step_total = 0
 
             # boolean which tracks if during the current step we do some extra logging
             do_grads_log = c.log_grads_every > 0 and step % c.log_grads_every == 0 and step > 0
             do_activations_log = c.log_activations_every > 0 and step % c.log_activations_every == 0 and step > 0
+            do_alignments_log = c.log_alignments_every > 0 and step % c.log_alignments_every == 0 and step > 0
 
             if not do_grads_log and not do_activations_log:
                 # we only track time when we do no extra logging
@@ -606,6 +748,11 @@ class LMDistilTrainer:
             
             # load the next training batch
             avg_loss = torch.tensor(0.0, device=c.device)
+
+            if do_alignments_log: 
+                # accumulating features over micro batches
+                features_s = []
+                features_t = []
 
             load_watch.start()
             total_batch_x, total_batch_y, _ = next(self.train_batches)
@@ -647,12 +794,13 @@ class LMDistilTrainer:
                         logits, curr_state = self.model(batch_x, curr_state, log=(self.logger, step))
                     else:
                         forward_watch.start()
-                        logits, curr_state = self.model(batch_x, curr_state, log=None)
-                        forward_watch.pause().count()      
+                        logits, curr_state = self.model(batch_x, curr_state)
+                        forward_watch.pause().count()  
                     
-                    with torch.no_grad(): t_logits, teacher_curr_state = self.teacher(batch_x, teacher_curr_state, log=None)              
+                    t_logits, teacher_curr_state = self.teacher(batch_x, teacher_curr_state)
+                    
+                
                     check(logits, (bsz, c.seq_len, c.vocab_size))
-
 
                     # compute loss
                     logits = logits.reshape(bsz * c.seq_len, c.vocab_size)
@@ -660,24 +808,46 @@ class LMDistilTrainer:
 
 
                     with torch.no_grad(): 
-                        total+=bsz*c.seq_len
                         average_non_max = (t_logits.sum(dim=1) - t_logits.max(dim=1)[0])/(c.vocab_size-1) # average over the non-max outputs
                         average_logits_magnitude += (t_logits.max(dim=1)[0] - average_non_max).sum(dim=0) 
 
                     if do_grads_log:
                         debug_utils.log_stats_and_dist(logits, "Logits", log=(self.logger, step))
+                    
                     batch_y = batch_y.reshape(bsz * c.seq_len)
+                    batch_y_one_hot = F.one_hot(batch_y, num_classes=c.vocab_size).to(torch.float)
+                    check(batch_y_one_hot, (bsz*c.seq_len, c.vocab_size))
+
                     if c.mse:
-                        micro_avg_labels_loss = F.mse_loss(logits, F.one_hot(batch_y, num_classes=c.vocab_size).to(torch.float) * average_logits_magnitude/total).reshape((-1,)) 
+                        micro_avg_labels_loss = F.mse_loss(logits, batch_y_one_hot * average_logits_magnitude/total).reshape((-1,)) 
                         micro_avg_distil_loss = F.mse_loss(logits, t_logits).reshape((-1,)) 
                     else:
                         micro_avg_labels_loss = F.cross_entropy(input=logits, target=batch_y).reshape((-1,))#F.mse_loss(logits, F.one_hot(batch_y, num_classes=)).reshape((-1,))#F.cross_entropy(input=logits, target=batch_y).reshape((-1,))
-                        micro_avg_distil_loss = F.kl_div(input=F.log_softmax(logits), target=F.softmax(t_logits), log_target=False, reduction='none').sum(dim=1).mean().reshape((-1,))
+                        micro_avg_distil_loss = F.kl_div(input=F.log_softmax(logits/T, dim=1), target=F.softmax(t_logits/T, dim=1), log_target=False, reduction='none').sum(dim=1).mean().reshape((-1,)) * (T**2) # temperature rescaling (for gradients)
+
                     check(micro_avg_labels_loss, (1,))
                     check(micro_avg_distil_loss, (1,))
                     micro_avg_loss = alpha*micro_avg_labels_loss+(1-alpha)*micro_avg_distil_loss
 
 
+                    if do_alignments_log and step_total<5000: 
+                        self.model.eval()
+                        with torch.no_grad(): 
+                            if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+                                phi_s = self.model.module.get_features(batch_x)   
+                                phi_t = self.teacher.module.get_features(batch_x) 
+                            else: 
+                                phi_s = self.model.get_features(batch_x)
+                                phi_t = self.teacher.get_features(batch_x)
+                        self.model.train()
+                        phi_s = phi_s.reshape(bsz * c.seq_len, c.h_dim)
+                        phi_t = phi_t.reshape(bsz * c.seq_len, self.c_t.h_dim)
+                        features_s.append(phi_s)
+                        features_t.append(phi_t)
+
+                    
+                    total+=bsz*c.seq_len
+                    step_total+=bsz*c.seq_len
 
                     # keep a sum of the avg_loss of each micro batch
                     avg_loss = avg_loss + micro_avg_loss.detach()
@@ -704,9 +874,27 @@ class LMDistilTrainer:
                     micro_avg_loss.backward()
                 backward_watch.pause().count()
 
+
             # collect the avg_loss over all micro steps and devices and compute the average
             dist.reduce(avg_loss, op=dist.ReduceOp.SUM, dst=0)
             avg_loss = avg_loss.detach().item() / (parallel_utils.WORLD_SIZE * c.gradient_accumulation_steps)
+
+
+            if do_alignments_log:
+                features_s = torch.vstack(features_s).view(-1, c.h_dim)
+                features_t = torch.vstack(features_t).view(-1, self.c_t.h_dim)
+                if c.h_dim==self.c_t.h_dim:
+                    FA = features_alignment(features_t, features_s)
+                else: FA=torch.Tensor([-1]).to(c.device)
+                KS = torch.matmul(features_s, features_s.T)
+                KT = torch.matmul(features_t, features_t.T)
+
+                CKA = centered_kernal_alignment(KT,KS)
+
+                dist.reduce(CKA, op=dist.ReduceOp.SUM, dst=0)
+                dist.reduce(FA, op=dist.ReduceOp.SUM, dst=0)
+                avg_cka = CKA.cpu().item()/parallel_utils.WORLD_SIZE
+                avg_fa = FA.cpu().item()/parallel_utils.WORLD_SIZE
             
             # unscale gradients before clipping and logging
             if self.scaler:
@@ -746,7 +934,6 @@ class LMDistilTrainer:
                 eval_watch.start()
                 self.validation(curr_state=curr_state, step=step)
                 eval_watch.pause().count()
-                #TODO: we can evaluate the distance to the teacher and the agreement
 
             # Write logs to disk
             if parallel_utils.is_main_process() and c.log_metrics_every > 0 and step % c.log_metrics_every == 0 and step > 0:
@@ -784,9 +971,16 @@ class LMDistilTrainer:
                 self.logger.log(
                     {
                         "_train/loss": avg_loss,
-                        "_train/tokens_seen": tokens_seen,
+                        "_train/tokens_seen": tokens_seen
                     },
                     step
+                )
+                self.logger.log(
+                    {
+                        "_train/cka":avg_cka,
+                        "_train/fa":avg_fa
+                    }, 
+                    step=step
                 )
                 curr_lrs = [pg['lr'] for pg in self.opt.param_groups]
                 for idx, lr in enumerate(curr_lrs):  # lr for each param group
@@ -814,6 +1008,15 @@ class LMDistilTrainer:
                                                                            state=eval_state,
                                                                            data_source=self.eval_batches,
                                                                            max_steps=c.max_eval_steps)
+        
+        # measure validation cka and fa with teacher
+        cka, fa = evaluate_alignments(self.c, self.c_t, 
+                                      self.model, self.teacher, 
+                                      class_frequencies=self.class_frequencies,
+                                      data_source=self.eval_batches,
+                                      max_steps=c.max_eval_steps, 
+                                      weigh_by_frequency=True)
+        
         # loss and ppl over number of tokens
         eval_avg_loss = eval_total_loss / eval_token_count
         eval_ppl = math.exp(eval_avg_loss)
@@ -843,6 +1046,14 @@ class LMDistilTrainer:
                     "_eval/total_loss": eval_total_loss,
                 },
                 step
+            )
+
+            self.logger.log(
+                {
+                    "_eval/cka":cka,
+                    "_eval/fa":fa
+                }, 
+                step=step
             )
 
             # skip ppl logging for initial loss which skews the plot unnecessarily

@@ -70,7 +70,7 @@ class Model(torch.nn.Module):
     def get_init_state(self, batch_size, device):
        return None
     
-    def forward(self, x, state, log=None):
+    def get_features(self, x, log=None):
         bsz, seqlen = x.shape
         c = self.c
 
@@ -90,10 +90,24 @@ class Model(torch.nn.Module):
             x = layer(x, log=log)
             check(x, (bsz, seqlen, c.h_dim))
         
-        # project to vocab
         x = self.ln_f(x, log=log)
-        x = self.linear(x)
-        check(x, (bsz, seqlen, c.vocab_size))
+        
+        return x
+    
+    def forward_head(self, phi, log=None): 
+        bsz, seqlen, _ = phi.shape
+        
+        # project to vocab
+        out = self.linear(phi)
+        check(out, (bsz, seqlen, self.c.vocab_size))
+
+        return out
+
+    
+    def forward(self, x, state, log=None):
+
+        x = self.get_features(x, log=log)
+        x = self.forward_head(x, log=log)
         
         return x, state
 

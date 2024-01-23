@@ -57,8 +57,9 @@ def add_distil_configs(config):
     config.alpha = 0
     """ this is a GPT-medium size model trained for 96h RTX3090 hours which resulted in about 5.7B training tokens. 
     The training data is about 24B tokens in total. Achieves 2.032 nppl. It has about 330M parameters"""
-    config.teacher_checkpoint_path = "/media/hofmann-scratch/glanzillo/languini-models/gpt-medium"
+    config.teacher_checkpoint_path = "/media/hofmann-scratch/glanzillo/languini-models/gpt-mini"
     config.mse = False # flag: whether to use the mse loss or KL 
+    config.temperature = 1.
     return config
 
 def load_config(name=None, distil_experiment=False):
@@ -94,6 +95,7 @@ def load_config(name=None, distil_experiment=False):
         log_grads_every = 1_000,            # log gradients and step sizes
         log_activations_every = -1,         # log gradients and step sizes
         log_ckpt_every = 5_000,             # save model checkpoint to disk
+        log_alignments_every = 100,         # evaluate central kernel alignment and feature alignment on training data
 
         # logging
         logger_type = 'wandb',  # can be 'tb', 'wandb' or 'all'
@@ -112,7 +114,7 @@ def load_config(name=None, distil_experiment=False):
         c.mlp_dim = 2048
         c.head_dim = 32
         c.n_heads = 8
-    if name == 'mini2':
+    elif name == 'mini2':
         c.n_layers = 4
         c.h_dim = 1024
         c.mlp_dim = 2048
